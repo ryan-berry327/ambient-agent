@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment
+.env
+.env.local
+
+# Data & artefacts
+backend/data/
+backend/app/data/
+backend/specs/
+backend/reports/
+
+# Build outputs
+dashboard/.next/
+dashboard/out/
+sandbox_repo/dist/
+sandbox_repo/.git/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
