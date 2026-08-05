@@ -20,7 +20,7 @@ from app.database import (
 )
 from app.services.audio_capture import LiveAudioStream, run_replay_streams
 from app.services.audio_devices import list_devices
-from app.services.deepgram_client import DeepgramLiveClient
+from app.services.whisper_transcription import WhisperTranscriptionClient
 from app.services.distiller import distiller
 from app.services.ws_hub import ws_hub
 
@@ -34,12 +34,14 @@ class SessionManager:
         self._tasks: list[asyncio.Task] = []
         self._mic_stream: Optional[LiveAudioStream] = None
         self._system_stream: Optional[LiveAudioStream] = None
-        self._deepgram_mic: Optional[DeepgramLiveClient] = None
-        self._deepgram_system: Optional[DeepgramLiveClient] = None
+        self._whisper_mic: Optional[WhisperTranscriptionClient] = None
+        self._whisper_system: Optional[WhisperTranscriptionClient] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._sample_rates: dict[str, int] = {"mic": 16000, "system": 16000}
         self._force_distill_task: Optional[asyncio.Task] = None
         self._replay_mode = False
+        self._replay_mic_path: Optional[Path] = None
+        self._replay_system_path: Optional[Path] = None
 
     @property
     def active_session_id(self) -> Optional[str]:
@@ -54,10 +56,10 @@ class SessionManager:
                     from app.services.cost_tracker import estimate_cost_usd
 
                     dg_min = session.deepgram_minutes
-                    if self._deepgram_mic:
-                        dg_min += self._deepgram_mic.minutes_streamed
-                    if self._deepgram_system:
-                        dg_min += self._deepgram_system.minutes_streamed
+                    if self._whisper_mic:
+                        dg_min += self._whisper_mic.minutes_streamed
+                    if self._whisper_system:
+                        dg_min += self._whisper_system.minutes_streamed
                     return {
                         "session_id": session.id,
                         "status": session.status,
@@ -122,6 +124,8 @@ class SessionManager:
             mic_wav = (BACKEND_DIR / mic_wav).resolve()
         if not system_wav.is_absolute():
             system_wav = (BACKEND_DIR / system_wav).resolve()
+        self._replay_mic_path = mic_wav
+        self._replay_system_path = system_wav
 
         session_id = new_session_id()
         db = SessionLocal()
@@ -155,18 +159,14 @@ class SessionManager:
             with wave.open(str(system_wav), "rb") as wf:
                 self._sample_rates["system"] = wf.getframerate()
 
-            self._deepgram_mic = DeepgramLiveClient(
-                "mic", self._sample_rates["mic"], self._on_transcript, self._on_utterance_end, diarize=False
+            self._whisper_mic = WhisperTranscriptionClient(
+                "mic", self._sample_rates["mic"], self._on_transcript, self._on_utterance_end
             )
-            self._deepgram_system = DeepgramLiveClient(
-                "system",
-                self._sample_rates["system"],
-                self._on_transcript,
-                self._on_utterance_end,
-                diarize=True,
+            self._whisper_system = WhisperTranscriptionClient(
+                "system", self._sample_rates["system"], self._on_transcript, self._on_utterance_end
             )
-            await self._deepgram_mic.start()
-            await self._deepgram_system.start()
+            await self._whisper_mic.start()
+            await self._whisper_system.start()
 
             replay_task = asyncio.create_task(
                 run_replay_streams(mic_wav, system_wav, self._on_audio_chunk, self._stop_event)
@@ -189,18 +189,14 @@ class SessionManager:
             self._sample_rates["mic"] = self._mic_stream.sample_rate
             self._sample_rates["system"] = self._system_stream.sample_rate
 
-            self._deepgram_mic = DeepgramLiveClient(
-                "mic", self._sample_rates["mic"], self._on_transcript, self._on_utterance_end, diarize=False
+            self._whisper_mic = WhisperTranscriptionClient(
+                "mic", self._sample_rates["mic"], self._on_transcript, self._on_utterance_end
             )
-            self._deepgram_system = DeepgramLiveClient(
-                "system",
-                self._sample_rates["system"],
-                self._on_transcript,
-                self._on_utterance_end,
-                diarize=True,
+            self._whisper_system = WhisperTranscriptionClient(
+                "system", self._sample_rates["system"], self._on_transcript, self._on_utterance_end
             )
-            await self._deepgram_mic.start()
-            await self._deepgram_system.start()
+            await self._whisper_mic.start()
+            await self._whisper_system.start()
 
             self._mic_stream.start()
             self._system_stream.start()
@@ -259,14 +255,14 @@ class SessionManager:
 
         dg_mic_min = 0.0
         dg_sys_min = 0.0
-        if self._deepgram_mic:
-            await self._deepgram_mic.stop()
-            dg_mic_min = self._deepgram_mic.minutes_streamed
-            self._deepgram_mic = None
-        if self._deepgram_system:
-            await self._deepgram_system.stop()
-            dg_sys_min = self._deepgram_system.minutes_streamed
-            self._deepgram_system = None
+        if self._whisper_mic:
+            await self._whisper_mic.stop()
+            dg_mic_min = self._whisper_mic.minutes_streamed
+            self._whisper_mic = None
+        if self._whisper_system:
+            await self._whisper_system.stop()
+            dg_sys_min = self._whisper_system.minutes_streamed
+            self._whisper_system = None
 
         if had_live_audio:
             for task in self._tasks:
@@ -299,35 +295,19 @@ class SessionManager:
 
     def _on_audio_chunk(self, chunk: bytes, sample_rate: float, channel: str) -> None:
         self._sample_rates[channel] = int(sample_rate)
-        if channel == "mic" and self._deepgram_mic:
-            asyncio.create_task(self._deepgram_mic.send_audio(chunk))
-        elif channel == "system" and self._deepgram_system:
-            asyncio.create_task(self._deepgram_system.send_audio(chunk))
+        if channel == "mic" and self._whisper_mic:
+            asyncio.create_task(self._whisper_mic.send_audio(chunk))
+        elif channel == "system" and self._whisper_system:
+            asyncio.create_task(self._whisper_system.send_audio(chunk))
 
-    async def _on_transcript(self, msg: dict[str, Any], channel: str) -> None:
+    async def _on_transcript(self, channel: str, text: str, is_final: bool) -> None:
         if not self._session_id:
             return
-        channel_obj = msg.get("channel") or {}
-        alt = channel_obj.get("alternatives") or []
-        if not alt:
-            return
-        best = alt[0]
-        text = (best.get("transcript") or "").strip()
+        text = text.strip()
         if not text:
             return
-        is_final = msg.get("is_final", False)
-        words = best.get("words") or []
 
-        if channel == "mic":
-            speaker = "me"
-        else:
-            # Use diarization speaker label if available
-            speakers = set()
-            for w in words:
-                if "speaker" in w:
-                    speakers.add(str(w["speaker"]))
-            speaker = f"speaker-{min(speakers)}" if speakers else "remote"
-
+        speaker = "me" if channel == "mic" else "remote"
         now = utcnow()
 
         if is_final:
@@ -370,6 +350,8 @@ class SessionManager:
             )
 
     async def _on_utterance_end(self, channel: str) -> None:
+        if self._replay_mode:
+            return
         if self._session_id:
             await distiller.maybe_distill(self._session_id, trigger=f"utterance_end:{channel}")
 
@@ -381,10 +363,40 @@ class SessionManager:
 
     def _on_replay_finished(self, task: asyncio.Task) -> None:
         if self._loop and self._session_id and not self._stop_event.is_set():
-            asyncio.run_coroutine_threadsafe(
-                distiller.maybe_distill(self._session_id, trigger="replay_end", force=True),
-                self._loop,
-            )
+            asyncio.run_coroutine_threadsafe(self._after_replay(), self._loop)
+
+    async def _after_replay(self) -> None:
+        from app.services.whisper_transcription import transcribe_wav_file
+
+        loop = asyncio.get_running_loop()
+        # Replace partial VAD segments with full-file transcription for replay accuracy
+        if self._session_id and self._replay_mic_path and self._replay_system_path:
+            db = SessionLocal()
+            try:
+                db.query(TranscriptSegmentModel).filter(
+                    TranscriptSegmentModel.session_id == self._session_id
+                ).delete()
+                db.commit()
+            finally:
+                db.close()
+
+            for path, channel in (
+                (self._replay_mic_path, "mic"),
+                (self._replay_system_path, "system"),
+            ):
+                text = await loop.run_in_executor(None, transcribe_wav_file, path)
+                if text:
+                    await self._on_transcript(channel, text, True)
+
+        if self._whisper_mic:
+            await self._whisper_mic.flush()
+        if self._whisper_system:
+            await self._whisper_system.flush()
+        if self._session_id:
+            await distiller.maybe_distill(self._session_id, trigger="replay_end", force=True)
+            # Second distill after spacing to bump spec version for journey tab
+            await asyncio.sleep(settings.distill_min_interval_sec + 1)
+            await distiller.maybe_distill(self._session_id, trigger="replay_followup", force=True)
 
 
 session_manager = SessionManager()

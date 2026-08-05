@@ -82,7 +82,12 @@ def main() -> int:
 
     # Clean DB for deterministic run
     if DB.exists():
-        DB.unlink()
+        for _ in range(5):
+            try:
+                DB.unlink()
+                break
+            except PermissionError:
+                time.sleep(1)
 
     proc = subprocess.Popen(
         [
@@ -112,30 +117,49 @@ def main() -> int:
         # A: start session + replay
         state = http("POST", "/session/start", {})
         session_id = state["session_id"]
-        time.sleep(12)  # allow replay + deepgram
 
-        segs = db_query(
-            "SELECT channel, COUNT(*) c FROM transcript_segments WHERE session_id=? AND is_final=1 GROUP BY channel",
-            (session_id,),
-        )
-        channels = {r["channel"]: r["c"] for r in segs}
+        # Poll for transcript (Whisper + model load can take 60-120s first run)
+        channels: dict[str, int] = {}
+        for _ in range(60):
+            segs = db_query(
+                "SELECT channel, COUNT(*) c FROM transcript_segments WHERE session_id=? AND is_final=1 GROUP BY channel",
+                (session_id,),
+            )
+            channels = {r["channel"]: r["c"] for r in segs}
+            if channels.get("mic", 0) > 0 and channels.get("system", 0) > 0:
+                break
+            time.sleep(3)
         total = sum(channels.values())
         results["A_replay"] = {
             "pass": total > 0 and "mic" in channels and "system" in channels,
-            "notes": f"final segments by channel: {channels}, total={total}",
+            "notes": f"whisper finals by channel: {channels}, total={total}",
         }
 
-        # Wait for distill (replay_end + spacing)
-        time.sleep(15)
-        log_tail = proc.stdout.read() if proc.stdout else ""
-        distill_triggers = [line for line in (log_tail or "").splitlines() if "Distill" in line]
-
-        versions = db_query("SELECT spec_version FROM sessions WHERE id=?", (session_id,))
-        spec_v = versions[0]["spec_version"] if versions else 0
-        runs = db_query("SELECT trigger, spec_version FROM distill_runs WHERE session_id=? ORDER BY id", (session_id,))
+        # Poll for replay-end distill (Cursor cloud agent; ~60-90s per run)
+        spec_v = 0
+        runs = []
+        item_count = 0
+        for _ in range(120):
+            versions = db_query("SELECT spec_version FROM sessions WHERE id=?", (session_id,))
+            spec_v = versions[0]["spec_version"] if versions else 0
+            runs = db_query(
+                "SELECT trigger, spec_version FROM distill_runs WHERE session_id=? ORDER BY id",
+                (session_id,),
+            )
+            item_count = db_query(
+                "SELECT COUNT(*) c FROM spec_items WHERE session_id=?",
+                (session_id,),
+            )[0]["c"]
+            triggers = [r["trigger"] for r in runs]
+            replay_done = any("replay_end" in t or "replay_followup" in t for t in triggers)
+            if replay_done and item_count >= 1:
+                break
+            if spec_v >= 2 and item_count >= 1:
+                break
+            time.sleep(3)
         results["B_distiller"] = {
-            "pass": len(runs) >= 1 and spec_v >= 1,
-            "notes": f"distill_runs={ [dict(r) for r in runs] }, log_triggers={len(distill_triggers)}",
+            "pass": len(runs) >= 1 and spec_v >= 1 and item_count >= 1,
+            "notes": f"distill_runs={[dict(r) for r in runs]}, spec_v={spec_v}, items={item_count}",
         }
 
         changes = db_query(
@@ -159,6 +183,7 @@ def main() -> int:
         results["D_override"] = {"pass": override_ok, "notes": "retract+lock then unlock" if items else "no items to override"}
 
         # E: crash recovery
+        ws_types: set[str] = set()
         proc.kill()
         proc.wait(timeout=5)
         time.sleep(1)
@@ -208,7 +233,7 @@ def main() -> int:
                 or row[0]["haiku_input_tokens"] > 0
                 or stopped.get("haiku_input_tokens", 0) > 0
             ),
-            "notes": f"stopped={stopped}, db_row={dict(row[0]) if row else None}",
+            "notes": f"audio_min={row[0]['deepgram_minutes'] if row else 0}, cursor_tokens={stopped.get('haiku_input_tokens')}",
         }
 
         print(json.dumps(results, indent=2))

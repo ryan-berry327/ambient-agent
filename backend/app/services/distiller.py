@@ -1,14 +1,15 @@
-"""Anthropic distiller: transcript -> spec with structured deltas."""
+"""Cursor SDK distiller: transcript -> spec with structured deltas."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-import anthropic
+from app.services.cursor_api import cursor_client
 
 from app.config import settings
 from app.database import (
@@ -60,7 +61,6 @@ class DistillerService:
     def __init__(self) -> None:
         self._running = False
         self._last_distill_at: Optional[datetime] = None
-        self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
     @property
     def is_running(self) -> bool:
@@ -108,7 +108,13 @@ class DistillerService:
                     )
                     return False
 
-            logger.info("Distill scheduled session=%s trigger=%s force=%s pending=%s", session_id, trigger, force, new_finals)
+            logger.info(
+                "Distill scheduled session=%s trigger=%s force=%s pending=%s",
+                session_id,
+                trigger,
+                force,
+                new_finals,
+            )
             await self._run_distill(session_id, trigger)
             return True
         finally:
@@ -143,6 +149,12 @@ class DistillerService:
                     await self.maybe_distill(session_id, trigger="force_timer", force=True)
         finally:
             db.close()
+
+    def _call_cursor(self, user_content: str, retry: bool = False) -> str:
+        prompt = f"{DISTILL_PROMPT}\n\n{user_content}"
+        if retry:
+            prompt += "\n\nYour previous reply was not valid JSON. Return ONLY the JSON object, no markdown fences."
+        return cursor_client.prompt(prompt)
 
     async def _run_distill(self, session_id: str, trigger: str) -> None:
         self._running = True
@@ -196,43 +208,21 @@ class DistillerService:
                 f"## Current spec\n{json.dumps(current_spec, indent=2)}"
             )
 
-            response = self._client.messages.create(
-                model=settings.anthropic_model,
-                max_tokens=4096,
-                system=DISTILL_PROMPT,
-                messages=[{"role": "user", "content": user_content}],
-            )
-
-            raw_text = ""
-            for block in response.content:
-                if block.type == "text":
-                    raw_text += block.text
-
+            # Cursor SDK bridge fails in thread pools on Windows — call synchronously.
+            raw_text = self._call_cursor(user_content, False)
             parsed, parse_ok = self._parse_distill_output(raw_text, current_items)
             if not parse_ok:
                 logger.warning("Distill JSON parse failed; retrying once session=%s", session_id)
-                retry = self._client.messages.create(
-                    model=settings.anthropic_model,
-                    max_tokens=4096,
-                    system=DISTILL_PROMPT,
-                    messages=[
-                        {"role": "user", "content": user_content},
-                        {
-                            "role": "user",
-                            "content": "Your previous reply was not valid JSON. Return ONLY the JSON object, no markdown fences.",
-                        },
-                    ],
-                )
-                retry_text = "".join(b.text for b in retry.content if b.type == "text")
-                response.usage.input_tokens += retry.usage.input_tokens
-                response.usage.output_tokens += retry.usage.output_tokens
-                parsed, parse_ok = self._parse_distill_output(retry_text, current_items)
+                raw_text = self._call_cursor(user_content, True)
+                parsed, parse_ok = self._parse_distill_output(raw_text, current_items)
                 if not parse_ok:
                     logger.error("Distill JSON parse failed after retry session=%s", session_id)
                     raise ValueError("Distiller returned invalid JSON after retry")
-            new_version = session.spec_version + 1
 
-            # Apply locked items from DB over model output
+            new_version = session.spec_version + 1
+            input_tokens = max(len(user_content) // 4, 1)
+            output_tokens = max(len(raw_text) // 4, 1)
+
             locked_map = {i.uuid: i for i in current_items if i.locked_by_human}
             final_spec_items: list[dict[str, Any]] = []
             seen_ids: set[str] = set()
@@ -273,7 +263,6 @@ class DistillerService:
                         }
                     )
 
-            # Persist changes
             for change in parsed.changes:
                 db.add(
                     SpecChangeModel(
@@ -286,7 +275,6 @@ class DistillerService:
                     )
                 )
 
-            # Replace spec items for session
             db.query(SpecItemModel).filter(SpecItemModel.session_id == session_id).delete()
             for item in final_spec_items:
                 db.add(
@@ -305,8 +293,8 @@ class DistillerService:
                 )
 
             session.spec_version = new_version
-            session.haiku_input_tokens += response.usage.input_tokens
-            session.haiku_output_tokens += response.usage.output_tokens
+            session.haiku_input_tokens += input_tokens
+            session.haiku_output_tokens += output_tokens
 
             db.add(
                 DistillRunModel(
@@ -314,13 +302,12 @@ class DistillerService:
                     spec_version=new_version,
                     started_at=started,
                     finished_at=utcnow(),
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
                     trigger=trigger,
                 )
             )
 
-            # Mark segments as distilled
             db.query(TranscriptSegmentModel).filter(
                 TranscriptSegmentModel.session_id == session_id,
                 TranscriptSegmentModel.is_final == True,  # noqa: E712
@@ -329,7 +316,6 @@ class DistillerService:
 
             db.commit()
 
-            # Snapshot to disk
             snapshot = {
                 "version": new_version,
                 "changes": [c.model_dump() for c in parsed.changes],
@@ -378,11 +364,9 @@ class DistillerService:
         self, raw: str, current_items: list[SpecItemModel]
     ) -> tuple[DistillOutput, bool]:
         cleaned = raw.strip()
-        # Strip markdown fences anywhere in response
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
         cleaned = re.sub(r"```(?:json)?", "", cleaned).strip()
-        # Extract first JSON object if surrounded by prose
         if not cleaned.startswith("{"):
             match = re.search(r"\{[\s\S]*\}", cleaned)
             if match:

@@ -1,4 +1,4 @@
-"""Verify required API keys exist in backend/.env or environment (values not printed)."""
+"""Verify CURSOR_API_KEY is configured (value not printed)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ BACKEND = Path(__file__).resolve().parent.parent / "backend"
 ENV = BACKEND / ".env"
 EXAMPLE = BACKEND / ".env.example"
 
-REQUIRED = ("DEEPGRAM_API_KEY", "ANTHROPIC_API_KEY")
+REQUIRED = ("CURSOR_API_KEY",)
 
 
 def _load_env_file() -> dict[str, str]:
@@ -37,11 +37,11 @@ def main() -> int:
     if missing:
         print(f"HALT: Missing API keys for: {', '.join(missing)}")
         if not ENV.exists():
-            print(f"Create {ENV} from {EXAMPLE.name} or export keys in the environment.")
+            print(f"Create {ENV} from {EXAMPLE.name} and set CURSOR_API_KEY.")
         return 1
 
     source = "backend/.env" if ENV.exists() else "environment variables"
-    print(f"OK: DEEPGRAM_API_KEY and ANTHROPIC_API_KEY present ({source})")
+    print(f"OK: CURSOR_API_KEY present ({source})")
     return 0
 
 

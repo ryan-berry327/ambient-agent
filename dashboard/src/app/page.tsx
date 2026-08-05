@@ -253,7 +253,7 @@ export default function DashboardPage() {
         <div className="spacer" />
 
         <div className="cost-meter">
-          DG: {(session?.deepgram_minutes ?? 0).toFixed(2)} min · Haiku:{" "}
+          Audio: {(session?.deepgram_minutes ?? 0).toFixed(2)} min · Cursor:{" "}
           {(session?.haiku_input_tokens ?? 0).toLocaleString()} in /{" "}
           {(session?.haiku_output_tokens ?? 0).toLocaleString()} out · ~$
           {(session?.estimated_cost_usd ?? 0).toFixed(4)}
