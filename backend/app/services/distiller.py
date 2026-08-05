@@ -99,8 +99,16 @@ class DistillerService:
             if not force and self._last_distill_at:
                 elapsed = (now - self._last_distill_at).total_seconds()
                 if elapsed < settings.distill_min_interval_sec:
+                    logger.info(
+                        "Distill skipped (spacing) session=%s trigger=%s elapsed=%.1fs min=%s",
+                        session_id,
+                        trigger,
+                        elapsed,
+                        settings.distill_min_interval_sec,
+                    )
                     return False
 
+            logger.info("Distill scheduled session=%s trigger=%s force=%s pending=%s", session_id, trigger, force, new_finals)
             await self._run_distill(session_id, trigger)
             return True
         finally:
@@ -126,6 +134,12 @@ class DistillerService:
             if self._last_distill_at:
                 elapsed = (now - self._last_distill_at).total_seconds()
                 if elapsed >= settings.distill_force_interval_sec:
+                    logger.info(
+                        "Distill force_timer session=%s elapsed=%.1fs pending=%s",
+                        session_id,
+                        elapsed,
+                        pending,
+                    )
                     await self.maybe_distill(session_id, trigger="force_timer", force=True)
         finally:
             db.close()
@@ -194,7 +208,28 @@ class DistillerService:
                 if block.type == "text":
                     raw_text += block.text
 
-            parsed = self._parse_distill_output(raw_text, current_items)
+            parsed, parse_ok = self._parse_distill_output(raw_text, current_items)
+            if not parse_ok:
+                logger.warning("Distill JSON parse failed; retrying once session=%s", session_id)
+                retry = self._client.messages.create(
+                    model=settings.anthropic_model,
+                    max_tokens=4096,
+                    system=DISTILL_PROMPT,
+                    messages=[
+                        {"role": "user", "content": user_content},
+                        {
+                            "role": "user",
+                            "content": "Your previous reply was not valid JSON. Return ONLY the JSON object, no markdown fences.",
+                        },
+                    ],
+                )
+                retry_text = "".join(b.text for b in retry.content if b.type == "text")
+                response.usage.input_tokens += retry.usage.input_tokens
+                response.usage.output_tokens += retry.usage.output_tokens
+                parsed, parse_ok = self._parse_distill_output(retry_text, current_items)
+                if not parse_ok:
+                    logger.error("Distill JSON parse failed after retry session=%s", session_id)
+                    raise ValueError("Distiller returned invalid JSON after retry")
             new_version = session.spec_version + 1
 
             # Apply locked items from DB over model output
@@ -339,32 +374,38 @@ class DistillerService:
             db.close()
             self._running = False
 
-    def _parse_distill_output(self, raw: str, current_items: list[SpecItemModel]) -> DistillOutput:
+    def _parse_distill_output(
+        self, raw: str, current_items: list[SpecItemModel]
+    ) -> tuple[DistillOutput, bool]:
         cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-            cleaned = re.sub(r"\s*```$", "", cleaned)
+        # Strip markdown fences anywhere in response
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        cleaned = re.sub(r"```(?:json)?", "", cleaned).strip()
+        # Extract first JSON object if surrounded by prose
+        if not cleaned.startswith("{"):
+            match = re.search(r"\{[\s\S]*\}", cleaned)
+            if match:
+                cleaned = match.group(0)
+        fallback_spec = [
+            {
+                "id": item.uuid,
+                "requirement": item.requirement,
+                "status": item.status,
+                "evidence_quote": item.evidence_quote,
+                "category": item.category,
+                "acceptance_hint": item.acceptance_hint,
+                "supersedes": item.supersedes,
+                "locked_by_human": item.locked_by_human,
+            }
+            for item in current_items
+        ]
         try:
             data = json.loads(cleaned)
-            return DistillOutput.model_validate(data)
+            return DistillOutput.model_validate(data), True
         except Exception as exc:
-            logger.warning("Failed to parse distill JSON: %s", exc)
-            return DistillOutput(
-                changes=[],
-                spec=[
-                    {
-                        "id": item.uuid,
-                        "requirement": item.requirement,
-                        "status": item.status,
-                        "evidence_quote": item.evidence_quote,
-                        "category": item.category,
-                        "acceptance_hint": item.acceptance_hint,
-                        "supersedes": item.supersedes,
-                        "locked_by_human": item.locked_by_human,
-                    }
-                    for item in current_items
-                ],
-            )
+            logger.warning("Failed to parse distill JSON: %s raw=%r", exc, raw[:200])
+            return DistillOutput(changes=[], spec=fallback_spec), False
 
 
 distiller = DistillerService()

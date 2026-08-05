@@ -53,6 +53,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    session_manager.recover_interrupted_sessions()
     logger.info("Database initialized at %s", settings.database_path)
 
 

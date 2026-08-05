@@ -210,10 +210,44 @@ class SessionManager:
 
         return self.get_state()
 
-    async def stop(self) -> dict[str, Any]:
-        if not self._session_id:
-            return self.get_state()
+    def recover_interrupted_sessions(self) -> None:
+        """Mark orphaned in-memory state; DB rows stay running for read recovery."""
+        db = SessionLocal()
+        try:
+            running = (
+                db.query(SessionModel)
+                .filter(SessionModel.status == SessionStatus.RUNNING.value)
+                .order_by(SessionModel.started_at.desc())
+                .all()
+            )
+            for session in running:
+                logger.warning(
+                    "Recovered interrupted session %s (spec_v=%s) — read-only until stopped",
+                    session.id,
+                    session.spec_version,
+                )
+        finally:
+            db.close()
 
+    async def stop(self) -> dict[str, Any]:
+        session_id = self._session_id
+        if not session_id:
+            db = SessionLocal()
+            try:
+                interrupted = (
+                    db.query(SessionModel)
+                    .filter(SessionModel.status == SessionStatus.RUNNING.value)
+                    .order_by(SessionModel.started_at.desc())
+                    .first()
+                )
+                if interrupted:
+                    session_id = interrupted.id
+            finally:
+                db.close()
+            if not session_id:
+                return self.get_state()
+
+        had_live_audio = self._session_id is not None
         self._stop_event.set()
 
         if self._mic_stream:
@@ -223,31 +257,31 @@ class SessionManager:
             self._system_stream.stop()
             self._system_stream = None
 
+        dg_mic_min = 0.0
+        dg_sys_min = 0.0
         if self._deepgram_mic:
             await self._deepgram_mic.stop()
             dg_mic_min = self._deepgram_mic.minutes_streamed
             self._deepgram_mic = None
-        else:
-            dg_mic_min = 0.0
         if self._deepgram_system:
             await self._deepgram_system.stop()
             dg_sys_min = self._deepgram_system.minutes_streamed
             self._deepgram_system = None
-        else:
-            dg_sys_min = 0.0
 
-        for task in self._tasks:
-            task.cancel()
-        self._tasks.clear()
+        if had_live_audio:
+            for task in self._tasks:
+                task.cancel()
+            self._tasks.clear()
 
-        session_id = self._session_id
+        session_id = self._session_id or session_id
         db = SessionLocal()
         try:
             session = db.get(SessionModel, session_id)
             if session:
                 session.status = SessionStatus.IDLE.value
                 session.stopped_at = utcnow()
-                session.deepgram_minutes += dg_mic_min + dg_sys_min
+                if had_live_audio:
+                    session.deepgram_minutes += dg_mic_min + dg_sys_min
                 db.commit()
         finally:
             db.close()
