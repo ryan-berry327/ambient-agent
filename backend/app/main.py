@@ -21,7 +21,10 @@ from app.database import (
     init_db,
 )
 from app.schemas import (
+    BriefOut,
+    BuildRunOut,
     DeviceInfo,
+    PathwaySelectRequest,
     SessionStartRequest,
     SessionStateOut,
     SpecChangeOut,
@@ -32,6 +35,8 @@ from app.schemas import (
     TranscriptSegmentOut,
 )
 from app.services.audio_devices import list_devices
+from app.services.brief_service import brief_service
+from app.services.builder_service import builder_service
 from app.services.cost_tracker import estimate_cost_usd
 from app.services.session_manager import session_manager
 from app.services.ws_hub import ws_hub
@@ -67,7 +72,11 @@ def _active_session_id(db: Session) -> Optional[str]:
         .order_by(SessionModel.started_at.desc())
         .first()
     )
-    return running.id if running else None
+    if running:
+        return running.id
+    # Allow brief/build after the call ends
+    latest = db.query(SessionModel).order_by(SessionModel.started_at.desc()).first()
+    return latest.id if latest else None
 
 
 @app.get("/devices", response_model=list[DeviceInfo])
@@ -183,6 +192,76 @@ def get_spec_changes(db: Session = Depends(get_db)) -> list[SpecChangeOut]:
     ]
 
 
+@app.get("/brief", response_model=Optional[BriefOut])
+def get_brief(db: Session = Depends(get_db)) -> Optional[BriefOut]:
+    sid = _active_session_id(db)
+    if not sid:
+        # Fall back to most recent session with a brief
+        from app.database import BriefModel
+
+        row = db.query(BriefModel).order_by(BriefModel.created_at.desc()).first()
+        if not row:
+            return None
+        return brief_service.get_brief(row.session_id)
+    return brief_service.get_brief(sid)
+
+
+@app.post("/brief/generate", response_model=BriefOut)
+async def generate_brief(db: Session = Depends(get_db)) -> BriefOut:
+    sid = _active_session_id(db)
+    if not sid:
+        raise HTTPException(status_code=404, detail="No active session")
+    try:
+        return await brief_service.generate(sid, use_cursor=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/brief/select-pathway", response_model=BriefOut)
+async def select_pathway(body: PathwaySelectRequest, db: Session = Depends(get_db)) -> BriefOut:
+    sid = _active_session_id(db)
+    if not sid:
+        raise HTTPException(status_code=404, detail="No active session")
+    try:
+        return await brief_service.select_pathway_async(sid, body.pathway_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/build/start", response_model=BuildRunOut)
+async def start_build(db: Session = Depends(get_db)) -> BuildRunOut:
+    sid = _active_session_id(db)
+    if not sid:
+        raise HTTPException(status_code=404, detail="No active session")
+    try:
+        return await builder_service.start_build(sid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/build/latest", response_model=Optional[BuildRunOut])
+def get_latest_build(db: Session = Depends(get_db)) -> Optional[BuildRunOut]:
+    sid = _active_session_id(db)
+    if not sid:
+        from app.database import BuildRunModel
+
+        row = db.query(BuildRunModel).order_by(BuildRunModel.id.desc()).first()
+        if not row:
+            return None
+        return builder_service.get_latest(row.session_id)
+    return builder_service.get_latest(sid)
+
+
 @app.post("/spec/{item_uuid}/override", response_model=SpecItemOut)
 async def override_spec(item_uuid: str, body: SpecOverrideRequest, db: Session = Depends(get_db)) -> SpecItemOut:
     sid = _active_session_id(db)
@@ -265,6 +344,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 "version": spec.version,
                                 "items": [i.model_dump() for i in spec.items],
                             },
+                        }
+                    )
+                brief = brief_service.get_brief(sid)
+                if brief:
+                    await websocket.send_json(
+                        {
+                            "type": "brief.updated",
+                            "payload": brief.model_dump(mode="json"),
+                        }
+                    )
+                build = builder_service.get_latest(sid)
+                if build:
+                    await websocket.send_json(
+                        {
+                            "type": "build.updated",
+                            "payload": build.model_dump(mode="json"),
                         }
                     )
         finally:

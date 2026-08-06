@@ -32,6 +32,15 @@ class Settings(BaseSettings):
 
     database_path: Path = BACKEND_DIR / "data" / "ambient.db"
     specs_dir: Path = BACKEND_DIR / "specs"
+    briefs_dir: Path = BACKEND_DIR / "briefs"
+    builds_dir: Path = PROJECT_ROOT / "sandbox_builds"
+
+    # Optional: push successful builds to GitHub (owner/repo)
+    github_token: str = ""
+    github_repo: str = ""
+
+    # Auto-generate brief after successful distill
+    auto_brief_after_distill: bool = True
 
 
 settings = Settings()

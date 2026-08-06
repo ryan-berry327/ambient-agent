@@ -13,7 +13,9 @@ venv/
 backend/data/
 backend/app/data/
 backend/specs/
+backend/briefs/
 backend/reports/
+sandbox_builds/
 
 # Build outputs
 dashboard/.next/

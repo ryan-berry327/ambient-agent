@@ -400,6 +400,9 @@ class DistillerService:
             await ws_hub.broadcast("distill.finished", {"session_id": session_id, "version": new_version})
             logger.info("Distill complete session=%s version=%s", session_id, new_version)
 
+            if settings.auto_brief_after_distill and final_spec_items:
+                asyncio.create_task(self._auto_brief(session_id))
+
         except Exception as exc:
             logger.exception("Distill failed: %s", exc)
             await ws_hub.broadcast("distill.finished", {"session_id": session_id, "error": str(exc)})
@@ -407,6 +410,14 @@ class DistillerService:
             db.close()
             self._running = False
             # Spacing-deferred jobs stay in _pending until _drain_pending after a run
+
+    async def _auto_brief(self, session_id: str) -> None:
+        try:
+            from app.services.brief_service import brief_service
+
+            await brief_service.generate(session_id, use_cursor=True)
+        except Exception as exc:
+            logger.warning("Auto-brief after distill failed session=%s: %s", session_id, exc)
 
     def _parse_distill_output(
         self, raw: str, current_items: list[SpecItemModel]
