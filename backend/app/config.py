@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     distill_force_interval_sec: float = 45.0
     whisper_model: str = "base"
     whisper_device: str = "cpu"
+    whisper_vad_rms_threshold: float = 150.0
+    # Future: set to "deepgram" for live streaming STT upgrade
+    transcription_backend: str = "whisper"
 
     database_path: Path = BACKEND_DIR / "data" / "ambient.db"
     specs_dir: Path = BACKEND_DIR / "specs"

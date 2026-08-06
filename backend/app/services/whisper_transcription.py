@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -22,7 +21,6 @@ FRAME_MS = 30
 FRAME_BYTES = int(VAD_RATE * FRAME_MS / 1000) * 2  # 16-bit mono
 SILENCE_FRAMES_END = 25  # ~750ms silence ends utterance
 MIN_SPEECH_FRAMES = 5  # ~150ms minimum speech
-SPEECH_RMS_THRESHOLD = 400  # tune for mic/system levels
 
 _whisper_model = None
 
@@ -65,7 +63,7 @@ def _is_speech_frame(frame: bytes) -> bool:
     if len(samples) == 0:
         return False
     rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
-    return rms > SPEECH_RMS_THRESHOLD
+    return rms > settings.whisper_vad_rms_threshold
 
 
 def _transcribe_pcm16_sync(pcm: bytes, sample_rate: int = VAD_RATE) -> str:
@@ -81,18 +79,6 @@ def _transcribe_pcm16_sync(pcm: bytes, sample_rate: int = VAD_RATE) -> str:
         best_of=1,
     )
     return " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
-
-
-def transcribe_wav_file(path: str | Path) -> str:
-    """Transcribe an entire WAV file (used at replay end for complete text)."""
-    import wave
-
-    path = Path(path)
-    with wave.open(str(path), "rb") as wf:
-        pcm = wf.readframes(wf.getnframes())
-        rate = wf.getframerate()
-    pcm16 = _resample_pcm16(pcm, rate, VAD_RATE)
-    return _transcribe_pcm16_sync(pcm16, VAD_RATE)
 
 
 class WhisperTranscriptionClient:

@@ -1,4 +1,4 @@
-"""Session orchestration: audio, Deepgram, distiller."""
+"""Session orchestration: audio, local Whisper transcription, distiller."""
 
 from __future__ import annotations
 
@@ -116,6 +116,22 @@ class SessionManager:
         if self._session_id:
             raise RuntimeError("Session already running")
 
+        # Orphaned rows from a crashed/restarted backend must not leak into API responses.
+        db = SessionLocal()
+        try:
+            orphaned = (
+                db.query(SessionModel)
+                .filter(SessionModel.status == SessionStatus.RUNNING.value)
+                .all()
+            )
+            for row in orphaned:
+                row.status = SessionStatus.IDLE.value
+                row.stopped_at = utcnow()
+            if orphaned:
+                db.commit()
+        finally:
+            db.close()
+
         self._loop = asyncio.get_running_loop()
         self._replay_mode = replay_mode if replay_mode is not None else settings.replay_mode
         mic_wav = Path(replay_mic_wav or settings.replay_mic_wav)
@@ -169,7 +185,7 @@ class SessionManager:
             await self._whisper_system.start()
 
             replay_task = asyncio.create_task(
-                run_replay_streams(mic_wav, system_wav, self._on_audio_chunk, self._stop_event)
+                run_replay_streams(mic_wav, system_wav, self._schedule_audio_chunk, self._stop_event)
             )
             replay_task.add_done_callback(self._on_replay_finished)
             self._tasks.append(replay_task)
@@ -207,21 +223,24 @@ class SessionManager:
         return self.get_state()
 
     def recover_interrupted_sessions(self) -> None:
-        """Mark orphaned in-memory state; DB rows stay running for read recovery."""
+        """Mark DB sessions left 'running' after a backend restart as idle."""
         db = SessionLocal()
         try:
             running = (
                 db.query(SessionModel)
                 .filter(SessionModel.status == SessionStatus.RUNNING.value)
-                .order_by(SessionModel.started_at.desc())
                 .all()
             )
             for session in running:
                 logger.warning(
-                    "Recovered interrupted session %s (spec_v=%s) — read-only until stopped",
+                    "Recovered interrupted session %s (spec_v=%s) — marked idle",
                     session.id,
                     session.spec_version,
                 )
+                session.status = SessionStatus.IDLE.value
+                session.stopped_at = utcnow()
+            if running:
+                db.commit()
         finally:
             db.close()
 
@@ -255,14 +274,16 @@ class SessionManager:
 
         dg_mic_min = 0.0
         dg_sys_min = 0.0
-        if self._whisper_mic:
-            await self._whisper_mic.stop()
-            dg_mic_min = self._whisper_mic.minutes_streamed
-            self._whisper_mic = None
-        if self._whisper_system:
-            await self._whisper_system.stop()
-            dg_sys_min = self._whisper_system.minutes_streamed
-            self._whisper_system = None
+        whisper_mic = self._whisper_mic
+        whisper_system = self._whisper_system
+        self._whisper_mic = None
+        self._whisper_system = None
+        if whisper_mic:
+            await whisper_mic.stop()
+            dg_mic_min = whisper_mic.minutes_streamed
+        if whisper_system:
+            await whisper_system.stop()
+            dg_sys_min = whisper_system.minutes_streamed
 
         if had_live_audio:
             for task in self._tasks:
@@ -287,18 +308,24 @@ class SessionManager:
         await ws_hub.broadcast("session.state", state)
         return state
 
-    def _on_audio_chunk_sync(self, chunk: bytes, sample_rate: float, channel: str) -> None:
-        if self._loop:
-            asyncio.run_coroutine_threadsafe(
-                self._on_audio_chunk(chunk, sample_rate, channel), self._loop
-            )
+    def _schedule_audio_chunk(self, chunk: bytes, sample_rate: float, channel: str) -> None:
+        """Hand off audio from capture/replay threads to the asyncio event loop."""
+        if not self._loop:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._on_audio_chunk(chunk, sample_rate, channel),
+            self._loop,
+        )
 
-    def _on_audio_chunk(self, chunk: bytes, sample_rate: float, channel: str) -> None:
+    def _on_audio_chunk_sync(self, chunk: bytes, sample_rate: float, channel: str) -> None:
+        self._schedule_audio_chunk(chunk, sample_rate, channel)
+
+    async def _on_audio_chunk(self, chunk: bytes, sample_rate: float, channel: str) -> None:
         self._sample_rates[channel] = int(sample_rate)
         if channel == "mic" and self._whisper_mic:
-            asyncio.create_task(self._whisper_mic.send_audio(chunk))
+            await self._whisper_mic.send_audio(chunk)
         elif channel == "system" and self._whisper_system:
-            asyncio.create_task(self._whisper_system.send_audio(chunk))
+            await self._whisper_system.send_audio(chunk)
 
     async def _on_transcript(self, channel: str, text: str, is_final: bool) -> None:
         if not self._session_id:
@@ -350,8 +377,6 @@ class SessionManager:
             )
 
     async def _on_utterance_end(self, channel: str) -> None:
-        if self._replay_mode:
-            return
         if self._session_id:
             await distiller.maybe_distill(self._session_id, trigger=f"utterance_end:{channel}")
 
@@ -366,37 +391,12 @@ class SessionManager:
             asyncio.run_coroutine_threadsafe(self._after_replay(), self._loop)
 
     async def _after_replay(self) -> None:
-        from app.services.whisper_transcription import transcribe_wav_file
-
-        loop = asyncio.get_running_loop()
-        # Replace partial VAD segments with full-file transcription for replay accuracy
-        if self._session_id and self._replay_mic_path and self._replay_system_path:
-            db = SessionLocal()
-            try:
-                db.query(TranscriptSegmentModel).filter(
-                    TranscriptSegmentModel.session_id == self._session_id
-                ).delete()
-                db.commit()
-            finally:
-                db.close()
-
-            for path, channel in (
-                (self._replay_mic_path, "mic"),
-                (self._replay_system_path, "system"),
-            ):
-                text = await loop.run_in_executor(None, transcribe_wav_file, path)
-                if text:
-                    await self._on_transcript(channel, text, True)
-
         if self._whisper_mic:
             await self._whisper_mic.flush()
         if self._whisper_system:
             await self._whisper_system.flush()
         if self._session_id:
             await distiller.maybe_distill(self._session_id, trigger="replay_end", force=True)
-            # Second distill after spacing to bump spec version for journey tab
-            await asyncio.sleep(settings.distill_min_interval_sec + 1)
-            await distiller.maybe_distill(self._session_id, trigger="replay_followup", force=True)
 
 
 session_manager = SessionManager()

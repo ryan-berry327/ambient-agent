@@ -6,7 +6,8 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from app.services.cursor_api import cursor_client
@@ -57,33 +58,29 @@ Rules:
 - Return ONLY valid JSON."""
 
 
+@dataclass
+class _DistillJob:
+    session_id: str
+    trigger: str
+    force: bool
+
+
 class DistillerService:
     def __init__(self) -> None:
         self._running = False
         self._last_distill_at: Optional[datetime] = None
+        self._pending: Optional[_DistillJob] = None
 
     @property
     def is_running(self) -> bool:
         return self._running
 
-    async def maybe_distill(
-        self,
-        session_id: str,
-        trigger: str = "utterance_end",
-        force: bool = False,
-    ) -> bool:
-        if self._running:
-            return False
+    def _count_pending_segments(self, session_id: str) -> int:
+        from app.database import TranscriptSegmentModel
 
         db = SessionLocal()
         try:
-            session = db.get(SessionModel, session_id)
-            if not session or session.status != "running":
-                return False
-
-            from app.database import TranscriptSegmentModel
-
-            new_finals = (
+            return (
                 db.query(TranscriptSegmentModel)
                 .filter(
                     TranscriptSegmentModel.session_id == session_id,
@@ -92,35 +89,72 @@ class DistillerService:
                 )
                 .count()
             )
-            if new_finals == 0 and not force:
-                return False
-
-            now = utcnow()
-            if not force and self._last_distill_at:
-                elapsed = (now - self._last_distill_at).total_seconds()
-                if elapsed < settings.distill_min_interval_sec:
-                    logger.info(
-                        "Distill skipped (spacing) session=%s trigger=%s elapsed=%.1fs min=%s",
-                        session_id,
-                        trigger,
-                        elapsed,
-                        settings.distill_min_interval_sec,
-                    )
-                    return False
-
-            logger.info(
-                "Distill scheduled session=%s trigger=%s force=%s pending=%s",
-                session_id,
-                trigger,
-                force,
-                new_finals,
-            )
-            await self._run_distill(session_id, trigger)
-            return True
         finally:
             db.close()
 
+    def _should_run(self, session_id: str, trigger: str, force: bool) -> bool:
+        db = SessionLocal()
+        try:
+            session = db.get(SessionModel, session_id)
+            if not session or session.status != "running":
+                return False
+        finally:
+            db.close()
+
+        new_finals = self._count_pending_segments(session_id)
+        if new_finals == 0 and not force:
+            return False
+
+        if not force and self._last_distill_at:
+            elapsed = (utcnow() - self._last_distill_at).total_seconds()
+            if elapsed < settings.distill_min_interval_sec:
+                logger.info(
+                    "Distill deferred (spacing) session=%s trigger=%s elapsed=%.1fs",
+                    session_id,
+                    trigger,
+                    elapsed,
+                )
+                self._pending = _DistillJob(session_id, trigger, force)
+                return False
+
+        return True
+
+    async def maybe_distill(
+        self,
+        session_id: str,
+        trigger: str = "utterance_end",
+        force: bool = False,
+    ) -> bool:
+        job = _DistillJob(session_id, trigger, force)
+        if self._running:
+            self._pending = job
+            logger.info("Distill queued session=%s trigger=%s (worker busy)", session_id, trigger)
+            return True
+
+        if not self._should_run(session_id, trigger, force):
+            return False
+
+        new_finals = self._count_pending_segments(session_id)
+        logger.info(
+            "Distill scheduled session=%s trigger=%s force=%s pending=%s",
+            session_id,
+            trigger,
+            force,
+            new_finals,
+        )
+        await self._run_distill(session_id, trigger)
+        await self._drain_pending()
+        return True
+
     async def force_if_stale(self, session_id: str) -> None:
+        if self._pending and not self._running:
+            job = self._pending
+            if self._should_run(job.session_id, job.trigger, job.force):
+                self._pending = None
+                await self._run_distill(job.session_id, job.trigger)
+                await self._drain_pending()
+                return
+
         db = SessionLocal()
         try:
             from app.database import TranscriptSegmentModel
@@ -149,6 +183,19 @@ class DistillerService:
                     await self.maybe_distill(session_id, trigger="force_timer", force=True)
         finally:
             db.close()
+
+    async def _drain_pending(self) -> None:
+        while self._pending:
+            job = self._pending
+            self._pending = None
+            if not self._should_run(job.session_id, job.trigger, job.force):
+                continue
+            logger.info(
+                "Distill running queued job session=%s trigger=%s",
+                job.session_id,
+                job.trigger,
+            )
+            await self._run_distill(job.session_id, job.trigger)
 
     def _call_cursor(self, user_content: str, retry: bool = False) -> str:
         prompt = f"{DISTILL_PROMPT}\n\n{user_content}"
@@ -208,12 +255,12 @@ class DistillerService:
                 f"## Current spec\n{json.dumps(current_spec, indent=2)}"
             )
 
-            # Cursor SDK bridge fails in thread pools on Windows — call synchronously.
-            raw_text = self._call_cursor(user_content, False)
+            # Run blocking Cursor REST polling off the event loop so WS + HTTP stay responsive.
+            raw_text = await asyncio.to_thread(self._call_cursor, user_content, False)
             parsed, parse_ok = self._parse_distill_output(raw_text, current_items)
             if not parse_ok:
                 logger.warning("Distill JSON parse failed; retrying once session=%s", session_id)
-                raw_text = self._call_cursor(user_content, True)
+                raw_text = await asyncio.to_thread(self._call_cursor, user_content, True)
                 parsed, parse_ok = self._parse_distill_output(raw_text, current_items)
                 if not parse_ok:
                     logger.error("Distill JSON parse failed after retry session=%s", session_id)
@@ -359,6 +406,7 @@ class DistillerService:
         finally:
             db.close()
             self._running = False
+            # Spacing-deferred jobs stay in _pending until _drain_pending after a run
 
     def _parse_distill_output(
         self, raw: str, current_items: list[SpecItemModel]

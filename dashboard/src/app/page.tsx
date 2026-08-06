@@ -101,14 +101,44 @@ export default function DashboardPage() {
     }
   }, []);
 
+  const fetchTranscript = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/transcript`);
+      const data = await res.json();
+      const segments: TranscriptSegment[] = data.segments ?? [];
+      setTranscript(segments);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const fetchSpec = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/spec`);
+      const data = await res.json();
+      setSpecItems(data.items ?? []);
+      if (data.version != null) setSpecVersion(data.version);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const connectWs = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    const existing = wsRef.current;
+    if (
+      existing?.readyState === WebSocket.OPEN ||
+      existing?.readyState === WebSocket.CONNECTING
+    ) {
+      return;
+    }
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
 
     ws.onopen = () => setConnected(true);
+    ws.onerror = () => ws.close();
     ws.onclose = () => {
       setConnected(false);
+      wsRef.current = null;
       setTimeout(connectWs, 2000);
     };
 
@@ -162,6 +192,23 @@ export default function DashboardPage() {
     return () => wsRef.current?.close();
   }, [fetchDevices, connectWs]);
 
+  useEffect(() => {
+    if (session?.status !== "running") {
+      if (session?.status === "idle") {
+        setTranscript([]);
+        setInterim({});
+      }
+      return;
+    }
+    fetchTranscript();
+    fetchSpec();
+    const id = setInterval(() => {
+      fetchTranscript();
+      fetchSpec();
+    }, 2000);
+    return () => clearInterval(id);
+  }, [session?.status, session?.session_id, fetchTranscript, fetchSpec]);
+
   const startSession = async () => {
     const body: Record<string, unknown> = {};
     if (micIndex !== "") body.mic_device_index = micIndex;
@@ -182,6 +229,8 @@ export default function DashboardPage() {
     setSpecVersion(0);
     const state = await res.json();
     setSession(state);
+    fetchTranscript();
+    fetchSpec();
   };
 
   const stopSession = async () => {
