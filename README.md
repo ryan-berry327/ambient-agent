@@ -78,6 +78,27 @@ When you're ready for production calls:
 
 The replay and live paths should share the same websocket client interface so the dashboard doesn't change.
 
-## Phase B (not yet)
+## Phase B — Brief → Build
 
-Builder agent in `sandbox_repo/` via Cursor SDK, auto-build, preview, reports.
+After distillation, the app can turn the spec into a **build brief** with:
+
+1. Actionable vs deferred requirements  
+2. Viability (`green` / `amber` / `red`) + constraints  
+3. Alternative pathways (exact / MVP / efficient)  
+4. **Build now** — scaffolds a project under `sandbox_builds/`, runs a dummy-data smoke test, and optionally pushes to GitHub
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /brief/generate` | Create brief + viability + pathways |
+| `POST /brief/select-pathway` | Choose pathway (`{ "pathway_id": "mvp" }`) |
+| `POST /build/start` | Scaffold, smoke-test, push |
+| `GET /brief` / `GET /build/latest` | Current brief / latest build |
+
+Optional `.env` for push:
+
+```
+GITHUB_TOKEN=ghp_...
+GITHUB_REPO=owner/repo-name
+```
+
+Without GitHub credentials, builds stay local (`push_status=local_only`) after a passing smoke test.

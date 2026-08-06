@@ -71,6 +71,12 @@ class SessionModel(Base):
     distill_runs: Mapped[list["DistillRunModel"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
     )
+    briefs: Mapped[list["BriefModel"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan"
+    )
+    build_runs: Mapped[list["BuildRunModel"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan"
+    )
 
 
 class TranscriptSegmentModel(Base):
@@ -135,20 +141,47 @@ class DistillRunModel(Base):
     session: Mapped["SessionModel"] = relationship(back_populates="distill_runs")
 
 
-class BuildRunModel(Base):
-    """Placeholder for Phase B."""
+class BriefModel(Base):
+    __tablename__ = "briefs"
 
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(36), ForeignKey("sessions.id"), index=True)
+    spec_version: Mapped[int] = mapped_column(Integer, default=0)
+    goal: Mapped[str] = mapped_column(Text, default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    actionable_json: Mapped[str] = mapped_column(Text, default="[]")
+    deferred_json: Mapped[str] = mapped_column(Text, default="[]")
+    viability_json: Mapped[str] = mapped_column(Text, default="{}")
+    pathways_json: Mapped[str] = mapped_column(Text, default="[]")
+    recommended_pathway_id: Mapped[str] = mapped_column(String(64), default="exact")
+    selected_pathway_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    session: Mapped["SessionModel"] = relationship(back_populates="briefs")
+
+
+class BuildRunModel(Base):
     __tablename__ = "build_runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(String(36), ForeignKey("sessions.id"), index=True)
     spec_version: Mapped[int] = mapped_column(Integer)
+    brief_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    pathway_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     files_changed: Mapped[str] = mapped_column(Text, default="[]")
     agent_summary: Mapped[str] = mapped_column(Text, default="")
     duration_sec: Mapped[float] = mapped_column(Float, default=0.0)
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    test_status: Mapped[str] = mapped_column(String(32), default="pending")
+    test_log: Mapped[str] = mapped_column(Text, default="")
+    push_status: Mapped[str] = mapped_column(String(32), default="pending")
+    repo_url: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+
+    session: Mapped["SessionModel"] = relationship(back_populates="build_runs")
 
 
 def utcnow() -> datetime:
@@ -161,6 +194,8 @@ def new_session_id() -> str:
 
 settings.database_path.parent.mkdir(parents=True, exist_ok=True)
 settings.specs_dir.mkdir(parents=True, exist_ok=True)
+settings.briefs_dir.mkdir(parents=True, exist_ok=True)
+settings.builds_dir.mkdir(parents=True, exist_ok=True)
 
 engine = create_engine(
     f"sqlite:///{settings.database_path}",
@@ -169,8 +204,33 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
+def _migrate_sqlite() -> None:
+    """Add Phase B columns to older ambient.db files."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "build_runs" not in inspector.get_table_names():
+        return
+    existing = {c["name"] for c in inspector.get_columns("build_runs")}
+    alters = {
+        "brief_id": "ALTER TABLE build_runs ADD COLUMN brief_id VARCHAR(36)",
+        "pathway_id": "ALTER TABLE build_runs ADD COLUMN pathway_id VARCHAR(64)",
+        "status": "ALTER TABLE build_runs ADD COLUMN status VARCHAR(32) DEFAULT 'queued'",
+        "test_status": "ALTER TABLE build_runs ADD COLUMN test_status VARCHAR(32) DEFAULT 'pending'",
+        "test_log": "ALTER TABLE build_runs ADD COLUMN test_log TEXT DEFAULT ''",
+        "push_status": "ALTER TABLE build_runs ADD COLUMN push_status VARCHAR(32) DEFAULT 'pending'",
+        "repo_url": "ALTER TABLE build_runs ADD COLUMN repo_url TEXT DEFAULT ''",
+        "error": "ALTER TABLE build_runs ADD COLUMN error TEXT DEFAULT ''",
+    }
+    with engine.begin() as conn:
+        for name, sql in alters.items():
+            if name not in existing:
+                conn.execute(text(sql))
+
+
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    _migrate_sqlite()
 
 
 def get_db():

@@ -94,3 +94,57 @@ class DistillOutput(BaseModel):
 class WSEvent(BaseModel):
     type: str
     payload: dict
+
+
+class PathwayOut(BaseModel):
+    id: str
+    title: str
+    summary: str
+    effort: str
+    tradeoffs: str
+    approach: str
+
+
+class ViabilityOut(BaseModel):
+    status: Literal["green", "amber", "red"]
+    summary: str
+    constraints: list[str] = Field(default_factory=list)
+
+
+class BriefOut(BaseModel):
+    id: str
+    session_id: str
+    spec_version: int
+    goal: str
+    summary: str
+    actionable_items: list[dict]
+    deferred_items: list[dict]
+    viability: ViabilityOut
+    pathways: list[PathwayOut]
+    recommended_pathway_id: str
+    selected_pathway_id: Optional[str] = None
+    created_at: datetime
+
+
+class PathwaySelectRequest(BaseModel):
+    pathway_id: str
+
+
+class BuildRunOut(BaseModel):
+    id: int
+    session_id: str
+    spec_version: int
+    brief_id: Optional[str] = None
+    pathway_id: Optional[str] = None
+    status: str
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    files_changed: list[str] = Field(default_factory=list)
+    agent_summary: str = ""
+    duration_sec: float = 0.0
+    cost_usd: float = 0.0
+    test_status: str = "pending"
+    test_log: str = ""
+    push_status: str = "pending"
+    repo_url: str = ""
+    error: str = ""
