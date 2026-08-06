@@ -20,6 +20,7 @@ sandbox_builds/
 # Build outputs
 dashboard/.next/
 dashboard/out/
+dashboard/tsconfig.tsbuildinfo
 sandbox_repo/dist/
 sandbox_repo/.git/
 sandbox_repo/
